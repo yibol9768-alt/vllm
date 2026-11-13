@@ -16,11 +16,13 @@ from torch import nn
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     runai_safetensors_weights_iterator,
 )
+from vllm.model_executor.utils import weights_already_processed
 from vllm.transformers_utils.s3_utils import glob as s3_glob
 from vllm.transformers_utils.utils import is_s3
 
@@ -187,6 +189,78 @@ class ShardedStateLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model, model_config.revision)
 
+    @staticmethod
+    def _all_quant_methods_support_pre_processed_weights(model: nn.Module) -> bool:
+        return all(
+            quant_method.supports_pre_processed_weights
+            for module in model.modules()
+            if isinstance(
+                quant_method := getattr(module, "quant_method", None),
+                QuantizeMethodBase,
+            )
+        )
+
+    def _process_weights_after_loading(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        target_device: torch.device,
+    ) -> None:
+        # ShardedStateLoader.save_model exports model.state_dict() after
+        # process_weights_after_loading has already run. Skip redundant weight
+        # transforms (such as FP8 weight transposes) so loaded checkpoints are
+        # not transformed a second time.
+        if self._all_quant_methods_support_pre_processed_weights(model):
+            with weights_already_processed():
+                super()._process_weights_after_loading(
+                    model, model_config, target_device
+                )
+        else:
+            super()._process_weights_after_loading(model, model_config, target_device)
+
+    @staticmethod
+    def _set_post_processed_tensor(
+        model: nn.Module,
+        key: str,
+        tensor: torch.Tensor,
+        default_device: torch.device,
+        *,
+        preserve_param_object: bool = True,
+    ) -> None:
+        mod_path, _, leaf = key.rpartition(".")
+        try:
+            module = model.get_submodule(mod_path) if mod_path else model
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+        if leaf in module._parameters:
+            existing = module._parameters[leaf]
+            device = (
+                existing.device
+                if existing is not None and not existing.is_meta
+                else default_device
+            )
+            loaded = tensor.to(device=device)
+            if preserve_param_object and existing is not None and not existing.is_meta:
+                existing.data = loaded
+            else:
+                module.register_parameter(
+                    leaf, nn.Parameter(loaded, requires_grad=False)
+                )
+        elif leaf in module._buffers:
+            existing = module._buffers[leaf]
+            device = (
+                existing.device
+                if existing is not None and not existing.is_meta
+                else default_device
+            )
+            module.register_buffer(leaf, tensor.to(device=device))
+        else:
+            module.register_parameter(
+                leaf,
+                nn.Parameter(tensor.to(device=default_device), requires_grad=False),
+            )
+
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
@@ -215,33 +289,53 @@ class ShardedStateLoader(BaseModelLoader):
                 f"only pre-sharded checkpoints are currently supported!"
             )
         state_dict = self._filter_subtensors(model.state_dict())
+        default_device = next(
+            (t.device for t in state_dict.values() if not t.is_meta),
+            torch.device("cpu"),
+        )
         counter_before_loading_weights = time.perf_counter()
         for key, tensor in self.iterate_over_files(filepaths):
-            # If loading with LoRA enabled, additional padding may
-            # be added to certain parameters. We only load into a
-            # narrowed view of the parameter data.
-            param = state_dict[key]
-            if param.dtype != tensor.dtype:
-                logger.warning(
-                    "Attempted to load weight %s with dtype %s into "
-                    "parameter with dtype %s",
+            if key not in state_dict:
+                # process_weights_after_loading before save_model may have added
+                # persistent buffers/parameters or un-aliased tied tensors.
+                self._set_post_processed_tensor(
+                    model,
                     key,
-                    tensor.dtype,
-                    param.dtype,
+                    tensor,
+                    default_device,
+                    preserve_param_object=False,
                 )
-            param_data = param.data
-            param_shape = param.shape
-            for dim, size in enumerate(tensor.shape):
-                if size < param_shape[dim]:
-                    param_data = param_data.narrow(dim, 0, size)
-            if tensor.shape != param_shape:
+                continue
+
+            param = state_dict[key]
+            if tensor.shape == param.shape and tensor.dtype == param.dtype:
+                param.data.copy_(tensor)
+            elif (
+                tensor.dtype == param.dtype
+                and tensor.ndim == param.ndim
+                and all(
+                    size <= param_size
+                    for size, param_size in zip(tensor.shape, param.shape)
+                )
+            ):
+                # If loading with LoRA enabled, additional padding may be added
+                # to certain parameters. Load into a narrowed view of the data.
+                param_data = param.data
+                for dim, size in enumerate(tensor.shape):
+                    if size < param.shape[dim]:
+                        param_data = param_data.narrow(dim, 0, size)
                 logger.warning(
                     "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
-                    param_shape,
+                    param.shape,
                 )
-            param_data.copy_(tensor)
+                param_data.copy_(tensor)
+            else:
+                # ShardedStateLoader.save_model exports post-processed tensors whose
+                # shape or dtype may differ from pre-processed create_model shapes
+                # (e.g. transposed FP8 weights or packed quantized tensors).
+                self._set_post_processed_tensor(model, key, tensor, default_device)
             state_dict.pop(key)
         counter_after_loading_weights = time.perf_counter()
         logger.info_once(

@@ -118,6 +118,144 @@ def test_load_weights_resolves_hf_repo_id(
     )
 
 
+def test_load_model_round_trips_post_processed_transposed_weights(
+    monkeypatch, tmp_path
+):
+    """Saved sharded checkpoints contain post-processed weights (e.g.
+    transposed FP8 weights or cast scales). Reloading must accept the saved
+    shapes/dtypes and enter weights_already_processed() so
+    process_weights_after_loading does not transform them a second time.
+    """
+    from unittest.mock import MagicMock
+
+    import torch
+    from safetensors.torch import save_file
+
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.utils import is_weights_pre_processed
+
+    _mock_pp_group(monkeypatch, 1)
+
+    class _TransposeQuantMethod(QuantizeMethodBase):
+        supports_pre_processed_weights = True
+
+        def create_weights(self, layer, *args, **kwargs):
+            pass
+
+        def apply(self, layer, *args, **kwargs):
+            pass
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            layer.kernel_ready = True
+            if is_weights_pre_processed():
+                return
+            layer.weight = torch.nn.Parameter(
+                layer.weight.t().contiguous(), requires_grad=False
+            )
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.to(torch.float32).squeeze(-1),
+                requires_grad=False,
+            )
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Module()
+            self.linear.quant_method = _TransposeQuantMethod()
+            self.linear.kernel_ready = False
+            self.linear.weight = torch.nn.Parameter(
+                torch.zeros(4, 8, dtype=torch.float16), requires_grad=False
+            )
+            self.linear.weight_scale = torch.nn.Parameter(
+                torch.ones(4, 1, dtype=torch.float16), requires_grad=False
+            )
+
+    src_model = _DummyModel()
+    expected_weight = torch.arange(32, dtype=torch.float16).reshape(4, 8)
+    expected_scale = torch.linspace(1.0, 4.0, 4, dtype=torch.float16).reshape(4, 1)
+    src_model.linear.weight.data.copy_(expected_weight)
+    src_model.linear.weight_scale.data.copy_(expected_scale)
+    src_model.linear.quant_method.process_weights_after_loading(src_model.linear)
+    assert src_model.linear.weight.shape == (8, 4)
+    assert src_model.linear.weight_scale.shape == (4,)
+    assert src_model.linear.weight_scale.dtype == torch.float32
+
+    save_file(
+        ShardedStateLoader._filter_subtensors(src_model.state_dict()),
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    reloaded_model = _DummyModel()
+    model_config = MagicMock()
+    model_config.model = str(tmp_path)
+    model_config.model_weights = None
+    model_config.revision = None
+    model_config.dtype = torch.float16
+    vllm_config = MagicMock()
+    vllm_config.device_config.device = "cpu"
+    vllm_config.load_config = LoadConfig(load_format="sharded_state")
+    vllm_config.model_config = model_config
+
+    loader = ShardedStateLoader(vllm_config.load_config)
+    monkeypatch.setattr(loader, "create_model", lambda **kwargs: reloaded_model)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.base_loader.finalize_layerwise_processing",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.base_loader.log_online_quantization_time",
+        lambda *args, **kwargs: None,
+    )
+    loaded = loader.load_model(vllm_config, model_config)
+
+    assert loaded.linear.kernel_ready
+    assert loaded.linear.weight.shape == (8, 4)
+    assert torch.equal(loaded.linear.weight, expected_weight.t().contiguous())
+    assert loaded.linear.weight_scale.shape == (4,)
+    assert loaded.linear.weight_scale.dtype == torch.float32
+    assert torch.equal(
+        loaded.linear.weight_scale, expected_scale.to(torch.float32).squeeze(-1)
+    )
+
+
+def test_load_weights_narrows_lora_padded_tensor(monkeypatch, tmp_path):
+    """Strictly smaller matching-dtype tensors still narrow for LoRA padding."""
+    from unittest.mock import MagicMock
+
+    import torch
+    from safetensors.torch import save_file
+
+    from vllm.config.load import LoadConfig
+
+    _mock_pp_group(monkeypatch, 1)
+    save_file(
+        {"weight": torch.ones(3, 8, dtype=torch.float16)},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    class _PaddedModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.zeros(5, 8, dtype=torch.float16), requires_grad=False
+            )
+
+    model = _PaddedModel()
+    model_config = MagicMock()
+    model_config.model = str(tmp_path)
+    model_config.model_weights = None
+    model_config.revision = None
+    ShardedStateLoader(LoadConfig(load_format="sharded_state")).load_weights(
+        model, model_config
+    )
+    assert model.weight.shape == (5, 8)
+    assert torch.equal(model.weight[:3], torch.ones(3, 8, dtype=torch.float16))
+    assert torch.equal(model.weight[3:], torch.zeros(2, 8, dtype=torch.float16))
+
+
 @pytest.mark.parametrize(
     "world_size,expected",
     [

@@ -72,6 +72,14 @@ class BaseModelLoader(ABC):
             "iterating weights by checkpoint name"
         )
 
+    def _process_weights_after_loading(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        target_device: torch.device,
+    ) -> None:
+        process_weights_after_loading(model, model_config, target_device)
+
     @instrument(span_name="Load model")
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -119,7 +127,7 @@ class BaseModelLoader(ABC):
             if _has_online_quant(model):
                 finalize_layerwise_processing(model, model_config)
 
-            process_weights_after_loading(model, model_config, target_device)
+            self._process_weights_after_loading(model, model_config, target_device)
             log_online_quantization_time(vllm_config)
 
             gc.collect()
