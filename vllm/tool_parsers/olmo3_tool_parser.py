@@ -34,6 +34,23 @@ _START_TAG = "<function_calls>"
 _END_TAG = "</function_calls>"
 
 
+def _split_call_body(body: str) -> tuple[str, bool]:
+    """Return the call text and whether a closing tag suffix is present.
+
+    Only a suffix counts, after trailing whitespace. A closing tag inside a
+    string argument is not a suffix once later chunks arrive, and the full
+    buffer is reparsed, so that tag stays in the argument. A trailing prefix
+    of the closing tag is withheld so partial tags are not parsed.
+    """
+    stripped = body.rstrip()
+    if stripped.endswith(_END_TAG):
+        return stripped[: -len(_END_TAG)], True
+    overlap = partial_tag_overlap(stripped, _END_TAG)
+    if overlap:
+        return stripped[:-overlap], False
+    return body, False
+
+
 class Olmo3PythonicToolParser(ToolParser):
     """Tool call parser for Olmo 3 models that produce tool calls as
     newline-separated pythonic strings.
@@ -62,6 +79,11 @@ class Olmo3PythonicToolParser(ToolParser):
     ):
         super().__init__(tokenizer, tools)
         self._sent_content_idx: int = 0
+        # Once a closed block is known not to be a call, later chunks are text.
+        self._pass_through_content: bool = False
+        # Index just after a finished call block. Text beyond it is trailing
+        # prose and is not parsed again.
+        self._closed_upto: int | None = None
 
     # Rename for readability. This is NOT a tool id.
     @property
@@ -148,6 +170,20 @@ class Olmo3PythonicToolParser(ToolParser):
             return content
         return None
 
+    def _begin_pass_through(
+        self, current_text: str, content: str | None
+    ) -> DeltaMessage | None:
+        """Emit every not-yet-sent character and keep doing so."""
+        self._pass_through_content = True
+        rest = current_text[self._sent_content_idx :]
+        self._sent_content_idx = len(current_text)
+        if content:
+            rest = content + rest
+        return DeltaMessage(content=rest) if rest else None
+
+    def _no_tools_streamed(self) -> bool:
+        return self.current_tool_id < 0 and not any(self.streamed_args_for_tool)
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -160,28 +196,34 @@ class Olmo3PythonicToolParser(ToolParser):
     ) -> DeltaMessage | None:
         if not previous_text:
             self._sent_content_idx = 0
+            self._pass_through_content = False
+            self._closed_upto = None
+
+        if self._pass_through_content:
+            return self._begin_pass_through(current_text, None)
+        if self._closed_upto is not None and len(current_text) > self._closed_upto:
+            return None
 
         content = self._extract_content(current_text)
         start_idx = current_text.find(_START_TAG)
         if start_idx == -1:
             return DeltaMessage(content=content) if content is not None else None
 
-        body = current_text[start_idx + len(_START_TAG) :]
-        end_idx = body.find(_END_TAG)
-        has_end_tag = end_idx != -1
-        if has_end_tag:
-            body = body[:end_idx]
-        else:
-            end_overlap = partial_tag_overlap(body, _END_TAG)
-            if end_overlap:
-                body = body[:-end_overlap]
-
-        if not body.strip():
+        body, has_end_tag = _split_call_body(
+            current_text[start_idx + len(_START_TAG) :]
+        )
+        # A block with no call syntax is ordinary text once it is closed.
+        # Until then, hold the tag back so a real call can still follow.
+        if "(" not in body:
+            if has_end_tag:
+                return self._begin_pass_through(current_text, content)
             return DeltaMessage(content=content) if content is not None else None
 
         try:
             valid_and_added_text = make_valid_python(body)
             if valid_and_added_text is None:
+                if has_end_tag and self._no_tools_streamed():
+                    return self._begin_pass_through(current_text, content)
                 return DeltaMessage(content=content) if content is not None else None
             valid_text, added_text = valid_and_added_text
 
@@ -246,6 +288,12 @@ class Olmo3PythonicToolParser(ToolParser):
                     ):
                         self.streamed_args_for_tool[index] += delta.function.arguments
 
+            # A suffix tag closed this block. Do not freeze when the suffix was
+            # only the end of an unclosed string: added quotes mean the next
+            # chunk still belongs to the argument.
+            if has_end_tag and "'" not in added_text and '"' not in added_text:
+                self._closed_upto = len(current_text.rstrip())
+
             # HACK: serving_chat.py inspects the internal state of tool parsers
             # when determining its final streaming delta, automatically
             # adding autocompleted JSON.
@@ -258,13 +306,15 @@ class Olmo3PythonicToolParser(ToolParser):
                 return DeltaMessage(content=content, tool_calls=tool_deltas)
             elif content is not None:
                 return DeltaMessage(content=content)
-            elif not added_text and self.current_tool_id > 0:
-                # Return an empty DeltaMessage once the tool calls are all done
-                # so that finish_reason gets set.
+            elif has_end_tag and not added_text and self.current_tool_id > 0:
+                # One empty delta once the closing tag has arrived. Name
+                # tokens and partial closing tags are not finished calls.
                 return DeltaMessage(content="")
             else:
                 return None
         except Exception:
+            if has_end_tag and self._no_tools_streamed():
+                return self._begin_pass_through(current_text, content)
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction error"

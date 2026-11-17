@@ -10,7 +10,8 @@ from tests.tool_parsers.utils import (
     run_tool_extraction,
     run_tool_extraction_streaming,
 )
-from vllm.entrypoints.generate.base.protocol import FunctionCall
+from vllm.entrypoints.generate.base.protocol import DeltaMessage, FunctionCall
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
 
@@ -67,6 +68,39 @@ ESCAPED_STRING_FUNCTION_CALL = FunctionCall(
     name="get_weather",
     arguments='{"city": "Martha\'s Vineyard", "metric": "\\"cool units\\""}',
 )
+END_TAG_IN_ARG_OUTPUT = (
+    "write_file(path='README.md', content='Calls are wrapped in "
+    "<function_calls>...</function_calls>.')"
+)
+END_TAG_IN_ARG_CALL = FunctionCall(
+    name="write_file",
+    arguments=(
+        '{"path": "README.md", "content": "Calls are wrapped in '
+        '<function_calls>...</function_calls>."}'
+    ),
+)
+
+
+def _char_deltas(tool_parser: ToolParser, model_output: str) -> list[DeltaMessage]:
+    """Feed model_output one character at a time and collect emitted deltas."""
+    request = ChatCompletionRequest(messages=[], model="test-model")
+    previous = ""
+    deltas: list[DeltaMessage] = []
+    for char in model_output:
+        current = previous + char
+        message = tool_parser.extract_tool_calls_streaming(
+            previous,
+            current,
+            char,
+            [],
+            [],
+            [],
+            request,
+        )
+        if message is not None:
+            deltas.append(message)
+        previous = current
+    return deltas
 
 
 @pytest.mark.parametrize(
@@ -357,19 +391,162 @@ def test_streaming_no_unexpected_ast_errors(
 
 
 def test_streaming_closing_tag_prefix_inside_string_arg(
-    default_tokenizer: TokenizerLike,
+    default_tokenizer: TokenizerLike, caplog: pytest.LogCaptureFixture
 ):
-    """A '</' substring inside a string argument is held briefly, not dropped."""
+    """A '</' substring inside a string argument is held briefly, not dropped.
+
+    The finished call matches the pre-fix parser. This also asserts that the
+    hold-back does not log UnexpectedAstError while '</' is still streaming.
+    """
     tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
         default_tokenizer
     )
     model_output = "<function_calls>render(html='<div></div>')</function_calls>"
 
-    reconstructor = run_tool_extraction_streaming(
-        tool_parser, list(model_output), assert_one_tool_per_delta=False
-    )
+    with caplog.at_level(logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"):
+        reconstructor = run_tool_extraction_streaming(
+            tool_parser, list(model_output), assert_one_tool_per_delta=False
+        )
 
+    assert caplog.records == []
     assert reconstructor.other_content == ""
     assert [tc.function for tc in reconstructor.tool_calls] == [
         FunctionCall(name="render", arguments='{"html": "<div></div>"}')
+    ]
+
+
+def test_streaming_end_tag_inside_string_argument(
+    default_tokenizer: TokenizerLike, caplog: pytest.LogCaptureFixture
+):
+    """A full closing tag inside a string argument stays part of that argument."""
+    model_output = f"<function_calls>{END_TAG_IN_ARG_OUTPUT}</function_calls>\nThanks"
+    inner_end = model_output.find("</function_calls>") + len("</function_calls>")
+    real_end = model_output.rfind(">") + 1
+    streams = [
+        list(model_output),
+        [
+            model_output[:inner_end],
+            model_output[inner_end:real_end],
+            model_output[real_end:],
+        ],
+    ]
+
+    for deltas in streams:
+        tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+            default_tokenizer
+        )
+        with caplog.at_level(
+            logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"
+        ):
+            reconstructor = run_tool_extraction_streaming(
+                tool_parser, deltas, assert_one_tool_per_delta=False
+            )
+        assert caplog.records == []
+        caplog.clear()
+        assert reconstructor.other_content == ""
+        assert [tc.function for tc in reconstructor.tool_calls] == [END_TAG_IN_ARG_CALL]
+
+    tool_parser = ToolParserManager.get_tool_parser("olmo3")(default_tokenizer)
+    content, tool_calls = run_tool_extraction(tool_parser, model_output, streaming=True)
+    assert content is None
+    assert [tc.function for tc in tool_calls] == [END_TAG_IN_ARG_CALL]
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "model_output",
+    [
+        "Explain this.\n<function_calls>this is not a call</function_calls>",
+        "Hello<function_calls></function_calls>",
+        "Hello<function_calls></function_calls> tail",
+    ],
+)
+def test_non_call_function_calls_block_is_content(
+    streaming: bool,
+    model_output: str,
+    default_tokenizer: TokenizerLike,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A <function_calls> block that is not a call stays in content."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+
+    with caplog.at_level(logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"):
+        content, tool_calls = run_tool_extraction(
+            tool_parser, model_output, streaming=streaming
+        )
+
+    assert content == model_output
+    assert tool_calls == []
+    assert caplog.records == []
+
+
+def test_streaming_non_call_block_char_deltas_do_not_log(
+    default_tokenizer: TokenizerLike, caplog: pytest.LogCaptureFixture
+):
+    """Char deltas of a non-call block log nothing and keep the whole string."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = "Explain this.\n<function_calls>this is not a call</function_calls>"
+
+    with caplog.at_level(logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"):
+        deltas = _char_deltas(tool_parser, model_output)
+
+    assert caplog.records == []
+    assert "".join(delta.content or "" for delta in deltas) == model_output
+    assert all(not delta.tool_calls for delta in deltas)
+
+
+def test_streaming_empty_content_only_after_end_tag(
+    default_tokenizer: TokenizerLike,
+):
+    """Name tokens and a partial closing tag do not emit empty content deltas."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = (
+        f"<function_calls>{SIMPLE_FUNCTION_OUTPUT}\n"
+        f"{PARAMETERLESS_FUNCTION_OUTPUT}</function_calls>"
+    )
+
+    deltas = _char_deltas(tool_parser, model_output)
+    empty_content = [
+        delta for delta in deltas if delta.content == "" and not delta.tool_calls
+    ]
+
+    assert len(empty_content) == 1
+    assert "".join(delta.content or "" for delta in deltas) == ""
+    reconstructor = run_tool_extraction_streaming(
+        ToolParserManager.get_tool_parser("olmo3")(default_tokenizer),
+        list(model_output),
+        assert_one_tool_per_delta=False,
+    )
+    assert [tc.function for tc in reconstructor.tool_calls] == [
+        SIMPLE_FUNCTION_CALL,
+        PARAMETERLESS_FUNCTION_CALL,
+    ]
+
+
+def test_streaming_drops_text_after_completed_call(
+    default_tokenizer: TokenizerLike, caplog: pytest.LogCaptureFixture
+):
+    """Prose after a finished call block is not content and is not reparsed."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = (
+        f"<function_calls>{PARAMETERLESS_FUNCTION_OUTPUT}</function_calls>\nThanks"
+    )
+
+    with caplog.at_level(logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"):
+        reconstructor = run_tool_extraction_streaming(
+            tool_parser, list(model_output), assert_one_tool_per_delta=False
+        )
+
+    assert caplog.records == []
+    assert reconstructor.other_content == ""
+    assert [tc.function for tc in reconstructor.tool_calls] == [
+        PARAMETERLESS_FUNCTION_CALL
     ]
