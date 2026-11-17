@@ -25,9 +25,13 @@ from vllm.tool_parsers.utils import (
     compute_tool_delta,
     handle_single_tool,
     make_valid_python,
+    partial_tag_overlap,
 )
 
 logger = init_logger(__name__)
+
+_START_TAG = "<function_calls>"
+_END_TAG = "</function_calls>"
 
 
 class Olmo3PythonicToolParser(ToolParser):
@@ -57,6 +61,7 @@ class Olmo3PythonicToolParser(ToolParser):
         tools: list[Tool] | None = None,
     ):
         super().__init__(tokenizer, tools)
+        self._sent_content_idx: int = 0
 
     # Rename for readability. This is NOT a tool id.
     @property
@@ -72,11 +77,13 @@ class Olmo3PythonicToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         """Extract the tool calls from a complete model response."""
         original_model_output = model_output
+        content: str | None = None
         # Remove xml tags.
         match = re.search(
             r"<function_calls>(.*?)</function_calls>", model_output, re.DOTALL
         )
         if match:
+            content = original_model_output[: match.start()] or None
             model_output = match.group(1).strip()
         # Make the newline separated function calls into a list.
         model_output = ", ".join(
@@ -115,7 +122,7 @@ class Olmo3PythonicToolParser(ToolParser):
                         handle_single_tool(e)  # type: ignore
                         for e in parsed.elts
                     ],
-                    content=None,
+                    content=content,
                 )
             else:
                 raise UnexpectedAstError("Tool output must be a list of function calls")
@@ -125,6 +132,21 @@ class Olmo3PythonicToolParser(ToolParser):
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=original_model_output
             )
+
+    def _extract_content(self, current_text: str) -> str | None:
+        """Return unsent leading prose, holding back partial start-tag prefixes."""
+        start_idx = current_text.find(_START_TAG)
+        if start_idx == -1:
+            overlap = partial_tag_overlap(current_text, _START_TAG)
+            sendable_idx = len(current_text) - overlap
+        else:
+            sendable_idx = start_idx
+
+        if sendable_idx > self._sent_content_idx:
+            content = current_text[self._sent_content_idx : sendable_idx]
+            self._sent_content_idx = sendable_idx
+            return content
+        return None
 
     def extract_tool_calls_streaming(
         self,
@@ -136,27 +158,31 @@ class Olmo3PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        # All function calls start with the <function_calls> tag.
-        # But since this is streaming, we may have seen only part of the tag.
-        start_tag = "<function_calls>"
-        if start_tag.startswith(current_text):
-            return None
-        if not current_text.startswith(start_tag):
-            # Release text withheld while it could still have been the tag.
-            if start_tag.startswith(previous_text):
-                return DeltaMessage(content=current_text)
-            return DeltaMessage(content=delta_text)
+        if not previous_text:
+            self._sent_content_idx = 0
+
+        content = self._extract_content(current_text)
+        start_idx = current_text.find(_START_TAG)
+        if start_idx == -1:
+            return DeltaMessage(content=content) if content is not None else None
+
+        body = current_text[start_idx + len(_START_TAG) :]
+        end_idx = body.find(_END_TAG)
+        has_end_tag = end_idx != -1
+        if has_end_tag:
+            body = body[:end_idx]
+        else:
+            end_overlap = partial_tag_overlap(body, _END_TAG)
+            if end_overlap:
+                body = body[:-end_overlap]
+
+        if not body.strip():
+            return DeltaMessage(content=content) if content is not None else None
 
         try:
-            # Remove xml tags.
-            if current_text.startswith("<function_calls>"):
-                current_text = current_text[len("<function_calls>") :]
-            if current_text.endswith("</function_calls>"):
-                current_text = current_text[: -len("</function_calls>")]
-
-            valid_and_added_text = make_valid_python(current_text)
+            valid_and_added_text = make_valid_python(body)
             if valid_and_added_text is None:
-                return None
+                return DeltaMessage(content=content) if content is not None else None
             valid_text, added_text = valid_and_added_text
 
             # Make the newline separated function calls into a list.
@@ -166,15 +192,26 @@ class Olmo3PythonicToolParser(ToolParser):
             valid_text = f"[{valid_text}]"
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
-            if not isinstance(parsed, ast.List) or not all(
-                isinstance(e, ast.Call) for e in parsed.elts
+            if not isinstance(parsed, ast.List):
+                raise UnexpectedAstError(
+                    "Tool output must be a sequence of newline-separated calls"
+                )
+            call_nodes = parsed.elts
+            if (
+                not has_end_tag
+                and not added_text
+                and call_nodes
+                and isinstance(call_nodes[-1], ast.Name | ast.Attribute)
             ):
+                # Function name is still streaming before its opening '('.
+                call_nodes = call_nodes[:-1]
+            if not all(isinstance(e, ast.Call) for e in call_nodes):
                 raise UnexpectedAstError(
                     "Tool output must be a sequence of newline-separated calls"
                 )
             tool_calls = [
                 handle_single_tool(e)  # type: ignore
-                for e in parsed.elts
+                for e in call_nodes
             ]
 
             tool_deltas = []
@@ -218,7 +255,9 @@ class Olmo3PythonicToolParser(ToolParser):
                 self.prev_tool_call_arr = [{"arguments": {}}]
 
             if tool_deltas:
-                return DeltaMessage(tool_calls=tool_deltas)
+                return DeltaMessage(content=content, tool_calls=tool_deltas)
+            elif content is not None:
+                return DeltaMessage(content=content)
             elif not added_text and self.current_tool_id > 0:
                 # Return an empty DeltaMessage once the tool calls are all done
                 # so that finish_reason gets set.
@@ -230,4 +269,4 @@ class Olmo3PythonicToolParser(ToolParser):
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction error"
             )
-            return None
+            return DeltaMessage(content=content) if content is not None else None

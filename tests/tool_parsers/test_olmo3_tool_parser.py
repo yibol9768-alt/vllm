@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -261,3 +262,114 @@ def test_regex_timeout_handling(streaming: bool, default_tokenizer: TokenizerLik
         assert content == fake_problematic_input
         assert len(tool_calls) == 0
         mock_regex.match.assert_called_once()
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "leading_prose, body, expected_calls",
+    [
+        pytest.param(
+            "Let me check.\n",
+            SIMPLE_FUNCTION_OUTPUT,
+            [SIMPLE_FUNCTION_CALL],
+            id="prose_single_call",
+        ),
+        pytest.param(
+            "Use 1 < 2 and <function>ok</function> first.\n",
+            SIMPLE_FUNCTION_OUTPUT,
+            [SIMPLE_FUNCTION_CALL],
+            id="prose_with_angle_brackets",
+        ),
+        pytest.param(
+            "Checking both:\n",
+            f"{SIMPLE_FUNCTION_OUTPUT}\n{PARAMETERLESS_FUNCTION_OUTPUT}",
+            [SIMPLE_FUNCTION_CALL, PARAMETERLESS_FUNCTION_CALL],
+            id="prose_parallel_calls",
+        ),
+    ],
+)
+def test_leading_prose_before_tool_calls(
+    streaming: bool,
+    leading_prose: str,
+    body: str,
+    expected_calls: list[FunctionCall],
+    default_tokenizer: TokenizerLike,
+):
+    """Leading prose before <function_calls> streams as content and preserves
+    tool extraction with streaming/non-streaming parity."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = f"{leading_prose}<function_calls>{body}</function_calls>"
+
+    content, tool_calls = run_tool_extraction(
+        tool_parser, model_output, streaming=streaming
+    )
+
+    assert content == leading_prose
+    assert [tc.function for tc in tool_calls] == expected_calls
+
+
+def test_streaming_split_tags_and_closing_suffix(default_tokenizer: TokenizerLike):
+    """Streaming handles prose+<function_calls> and )+</function_calls> in one delta."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output_deltas = [
+        "Let me ",
+        "check.\n<func",
+        "tion_calls>get_weather(city='San",
+        " Francisco', metric='celsius')</function",
+        "_calls>\n",
+    ]
+
+    reconstructor = run_tool_extraction_streaming(
+        tool_parser, model_output_deltas, assert_one_tool_per_delta=False
+    )
+
+    assert reconstructor.other_content == "Let me check.\n"
+    assert [tc.function for tc in reconstructor.tool_calls] == [SIMPLE_FUNCTION_CALL]
+
+
+def test_streaming_no_unexpected_ast_errors(
+    default_tokenizer: TokenizerLike, caplog: pytest.LogCaptureFixture
+):
+    """Char-by-char streaming logs no UnexpectedAstError on call names or end tags."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = (
+        f"<function_calls>{SIMPLE_FUNCTION_OUTPUT}\n"
+        f"{PARAMETERLESS_FUNCTION_OUTPUT}</function_calls>"
+    )
+
+    with caplog.at_level(logging.ERROR, logger="vllm.tool_parsers.olmo3_tool_parser"):
+        reconstructor = run_tool_extraction_streaming(
+            tool_parser, list(model_output), assert_one_tool_per_delta=False
+        )
+
+    assert caplog.records == []
+    assert reconstructor.other_content == ""
+    assert [tc.function for tc in reconstructor.tool_calls] == [
+        SIMPLE_FUNCTION_CALL,
+        PARAMETERLESS_FUNCTION_CALL,
+    ]
+
+
+def test_streaming_closing_tag_prefix_inside_string_arg(
+    default_tokenizer: TokenizerLike,
+):
+    """A '</' substring inside a string argument is held briefly, not dropped."""
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("olmo3")(
+        default_tokenizer
+    )
+    model_output = "<function_calls>render(html='<div></div>')</function_calls>"
+
+    reconstructor = run_tool_extraction_streaming(
+        tool_parser, list(model_output), assert_one_tool_per_delta=False
+    )
+
+    assert reconstructor.other_content == ""
+    assert [tc.function for tc in reconstructor.tool_calls] == [
+        FunctionCall(name="render", arguments='{"html": "<div></div>"}')
+    ]
